@@ -27,7 +27,7 @@ API_HASH = '708e7d0bc3572355bcaf68562cc068f1'
 TARGET_BOT = "@minonshoprobot"
 
 # Задержки между ответами (сек)
-MIN_DELAY = 0.5
+MIN_DELAY = 0.3
 MAX_DELAY = 0.7
 
 # ================== ВСЕ ТЕРРИТОРИИ ==================
@@ -405,6 +405,33 @@ class BotHunter:
             
             elif data == "back":
                 await self.show_main_menu(event)
+        
+        # Обработка текстовых команд для админов
+        @self.master_bot.on(events.NewMessage)
+        async def admin_commands(event):
+            if not is_admin(event.sender_id):
+                return
+            
+            text = event.message.text
+            if text.startswith('/add_admin '):
+                try:
+                    admin_id = int(text.split()[1])
+                    if add_admin(admin_id):
+                        await event.reply(f"✅ Админ {admin_id} добавлен")
+                    else:
+                        await event.reply(f"❌ Админ {admin_id} уже существует")
+                except:
+                    await event.reply("❌ Используйте: /add_admin <id>")
+            
+            elif text.startswith('/remove_admin '):
+                try:
+                    admin_id = int(text.split()[1])
+                    if remove_admin(admin_id):
+                        await event.reply(f"✅ Админ {admin_id} удален")
+                    else:
+                        await event.reply(f"❌ Админ {admin_id} не найден")
+                except:
+                    await event.reply("❌ Используйте: /remove_admin <id>")
     
     async def show_main_menu(self, event, message=None):
         keyboard = [
@@ -457,7 +484,7 @@ class BotHunter:
                 async def handler(event, p=phone):
                     await self.handle_message(p, event.message)
                 
-                logger.info(f"Клиент {phone} запущен")
+                logging.info(f"Клиент {phone} запущен")
     
     async def handle_message(self, phone: str, message: Message):
         """Обработка входящего сообщения от целевого бота"""
@@ -555,20 +582,18 @@ async def main():
     hunter = BotHunter()
     await hunter.start()
     
-    # Добавляем первого админа (вас) при первом запуске
+    # Добавляем первого админа (вас) через файл, без input()
     admins = load_admins()
     if not admins:
         print("\n" + "="*50)
         print("ПЕРВЫЙ ЗАПУСК!")
-        print("Введите ваш Telegram ID для добавления в админы:")
-        print("(Узнать ID можно у @userinfobot)")
+        print("Ваш Telegram ID нужно добавить вручную.")
+        print("Узнать ID можно у @userinfobot")
+        print("После этого отредактируйте файл admins.json")
+        print("Добавьте ваш ID в формате: [123456789]")
         print("="*50)
-        admin_id = input("Ваш ID: ").strip()
-        if admin_id.isdigit():
-            add_admin(int(admin_id))
-            print(f"✅ Админ {admin_id} добавлен!")
-        else:
-            print("❌ Неверный ID. Добавьте админа вручную в файл admins.json")
+        print("\n✅ Бот запущен! Но без админов.")
+        print("Добавьте себя в админы через файл admins.json")
     
     print("\n✅ Бот запущен!")
     print("Откройте Telegram и отправьте /start вашему боту")
