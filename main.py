@@ -17,21 +17,13 @@ ADMINS_FILE = "admins.json"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Токен вашего бота-управляющего
 MASTER_BOT_TOKEN = "8762511961:AAHTd2Khe6bmN0GtZqyAH8KVIpXn2SYUslY"
-
-# API данные (общие для всех сессий)
 API_ID = 35800959
 API_HASH = '708e7d0bc3572355bcaf68562cc068f1'
-
 TARGET_BOT = "@minonshoprobot"
 
-# Задержки между ответами (сек)
 MIN_DELAY = 0.3
 MAX_DELAY = 0.7
-
-# Временное хранилище для ожидающих авторизации
-pending_auth = {}
 
 # ================== ВСЕ ТЕРРИТОРИИ ==================
 all_territories = [
@@ -73,7 +65,6 @@ all_territories = [
 ]
 all_territories.sort()
 
-# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 def number_to_words_ru(num: int) -> str:
     units = ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять']
     teens = ['десять', 'одиннадцать', 'двенадцать', 'тринадцать', 'четырнадцать',
@@ -133,9 +124,10 @@ class SessionManager:
     def __init__(self):
         self.sessions: Dict[str, dict] = {}
         self.clients: Dict[str, TelegramClient] = {}
-        self.won_this_round: Dict[str, bool] = {}
         self.is_running = False
-        self.spam_tasks: Dict[str, asyncio.Task] = {}
+        self.current_task = None
+        self.current_round_winner = None
+        self.round_active = False
         self.load_sessions()
     
     def load_sessions(self):
@@ -166,9 +158,6 @@ class SessionManager:
             if phone in self.clients:
                 asyncio.create_task(self.clients[phone].disconnect())
                 del self.clients[phone]
-            if phone in self.spam_tasks:
-                self.spam_tasks[phone].cancel()
-                del self.spam_tasks[phone]
             self.save_sessions()
             return True
         return False
@@ -218,9 +207,9 @@ class SessionManager:
     
     async def stop_all(self):
         self.is_running = False
-        for task in self.spam_tasks.values():
-            task.cancel()
-        self.spam_tasks.clear()
+        self.round_active = False
+        if self.current_task:
+            self.current_task.cancel()
         for client in self.clients.values():
             await client.disconnect()
         self.clients.clear()
@@ -230,25 +219,15 @@ class BotHunter:
     def __init__(self):
         self.session_mgr = SessionManager()
         self.master_bot: Optional[TelegramClient] = None
+        self.pending_auth = {}
+        self.active_round_phones = []
+        self.current_round_index = 0
     
     async def start(self):
         self.master_bot = TelegramClient("master_bot", API_ID, API_HASH)
         await self.master_bot.start(bot_token=MASTER_BOT_TOKEN)
         
         # ========== КОМАНДЫ ДЛЯ ДОБАВЛЕНИЯ СЕССИЙ ==========
-        @self.master_bot.on(events.NewMessage(pattern='/add'))
-        async def add_session_cmd(event):
-            if not is_admin(event.sender_id):
-                await event.reply("❌ Нет доступа")
-                return
-            
-            await event.reply(
-                "📱 **Добавление сессии**\n\n"
-                "Отправьте номер телефона в формате:\n`+79991234567`\n\n"
-                "Или используйте команду:\n`/add_phone +79991234567`",
-                parse_mode='markdown'
-            )
-        
         @self.master_bot.on(events.NewMessage(pattern='/add_phone (.+)'))
         async def add_phone_cmd(event):
             if not is_admin(event.sender_id):
@@ -280,17 +259,13 @@ class BotHunter:
                 session_file = os.path.join(SESSIONS_DIR, f"session_{phone.replace('+', '')}")
                 client = TelegramClient(session_file, API_ID, API_HASH)
                 await client.connect()
-                
-                # Запрашиваем код
                 await client.send_code_request(phone)
                 
-                # Сохраняем клиент для этого телефона
-                pending_auth[phone] = client
+                self.pending_auth[phone] = client
                 
                 await event.reply(
                     f"📱 **Код подтверждения отправлен** на {phone}\n\n"
-                    f"Отправьте код командой:\n`/verify {phone} <код>`\n\n"
-                    f"Пример: `/verify {phone} 12345`"
+                    f"Отправьте код командой:\n`/verify {phone} <код>`"
                 )
             except Exception as e:
                 await event.reply(f"❌ Ошибка: {e}")
@@ -302,19 +277,17 @@ class BotHunter:
             
             phone, code = event.pattern_match.groups()
             
-            if phone not in pending_auth:
+            if phone not in self.pending_auth:
                 await event.reply(f"❌ Сначала выполните `/auth {phone}`")
                 return
             
-            client = pending_auth[phone]
+            client = self.pending_auth[phone]
             
             try:
                 await client.sign_in(phone, code)
                 await event.reply(f"✅ Сессия {phone} успешно авторизована!")
-                
-                # Сохраняем клиент
                 self.session_mgr.clients[phone] = client
-                del pending_auth[phone]
+                del self.pending_auth[phone]
                 
             except errors.SessionPasswordNeededError:
                 await event.reply(
@@ -331,23 +304,22 @@ class BotHunter:
             
             phone, password = event.pattern_match.groups()
             
-            if phone not in pending_auth:
+            if phone not in self.pending_auth:
                 await event.reply(f"❌ Сначала выполните `/auth {phone}`")
                 return
             
-            client = pending_auth[phone]
+            client = self.pending_auth[phone]
             
             try:
                 await client.sign_in(password=password)
                 await event.reply(f"✅ Сессия {phone} успешно авторизована!")
-                
                 self.session_mgr.clients[phone] = client
-                del pending_auth[phone]
+                del self.pending_auth[phone]
                 
             except Exception as e:
                 await event.reply(f"❌ Ошибка: {e}")
         
-        # ========== ОСТАЛЬНЫЕ КОМАНДЫ ==========
+        # ========== ОСНОВНЫЕ КОМАНДЫ ==========
         @self.master_bot.on(events.NewMessage(pattern='/start'))
         async def start_cmd(event):
             if not is_admin(event.sender_id):
@@ -355,7 +327,7 @@ class BotHunter:
                 return
             
             await event.reply(
-                "🤖 **Бот для автоматического выигрыша аккаунтов**\n\n"
+                "🤖 **Бот для автоматического выигрыша аккаунтов (поочередно)**\n\n"
                 f"📊 Активных сессий: {len(self.session_mgr.get_active_phones())}\n"
                 f"🎯 Целевой бот: {TARGET_BOT}\n\n"
                 "**Доступные команды:**\n"
@@ -365,12 +337,14 @@ class BotHunter:
                 "/2fa +79991234567 пароль - ввести 2FA\n"
                 "/list - список сессий\n"
                 "/check - проверить сессии\n"
-                "/start_all - запустить всех\n"
+                "/start_all - запустить поочередный спам\n"
                 "/stop_all - остановить всех\n"
                 "/toggle +79991234567 - вкл/выкл сессию\n"
                 "/remove +79991234567 - удалить сессию\n"
                 "/add_admin id - добавить админа\n"
-                "/remove_admin id - удалить админа",
+                "/remove_admin id - удалить админа\n\n"
+                "🔄 **Режим работы:** Аккаунты спамят ПООЧЕРЕДНО.\n"
+                "Первый выигрывает → ждет следующего конкурса → следующий аккаунт спамит",
                 parse_mode='markdown'
             )
         
@@ -416,18 +390,18 @@ class BotHunter:
             if not is_admin(event.sender_id):
                 return
             
-            await event.reply("🚀 Запускаю всех...")
-            await self.run_all_clients()
-            await event.reply("✅ Все активные сессии запущены!")
+            await event.reply("🔄 Запускаю поочередный спам...")
+            await self.run_round_robin()
+            await event.reply("✅ Поочередный спам запущен!")
         
         @self.master_bot.on(events.NewMessage(pattern='/stop_all'))
         async def stop_all_cmd(event):
             if not is_admin(event.sender_id):
                 return
             
-            await event.reply("⏹️ Останавливаю всех...")
+            await event.reply("⏹️ Останавливаю...")
             await self.session_mgr.stop_all()
-            await event.reply("✅ Все сессии остановлены!")
+            await event.reply("✅ Все остановлено!")
         
         @self.master_bot.on(events.NewMessage(pattern='/toggle (.+)'))
         async def toggle_cmd(event):
@@ -479,44 +453,79 @@ class BotHunter:
                     await event.reply(f"❌ Админ {admin_id} не найден")
             except:
                 await event.reply("❌ Используйте: /remove_admin 123456789")
-    
-    async def run_all_clients(self):
-        self.session_mgr.is_running = True
-        phones = self.session_mgr.get_active_phones()
         
+        # ========== ОБРАБОТЧИК СООБЩЕНИЙ ОТ ЦЕЛЕВОГО БОТА ==========
+        await self.setup_message_handlers()
+    
+    async def setup_message_handlers(self):
+        """Устанавливаем обработчики для всех клиентов"""
+        phones = self.session_mgr.get_active_phones()
         for phone in phones:
             client = await self.session_mgr.get_client(phone)
             if client:
                 @client.on(events.NewMessage(chats=TARGET_BOT))
                 async def handler(event, p=phone):
-                    await self.handle_message(p, event.message)
-                logging.info(f"Клиент {phone} запущен")
+                    await self.handle_target_message(p, event.message)
     
-    async def handle_message(self, phone: str, message: Message):
+    async def run_round_robin(self):
+        """Запускает поочередный спам: сначала 1 аккаунт спамит до выигрыша, потом следующий"""
+        self.session_mgr.is_running = True
+        
+        while self.session_mgr.is_running:
+            # Получаем активные аккаунты
+            active_phones = self.session_mgr.get_active_phones()
+            
+            if not active_phones:
+                await self.master_bot.send_message(MASTER_BOT_TOKEN, "⚠️ Нет активных сессий")
+                break
+            
+            for phone in active_phones:
+                if not self.session_mgr.is_running:
+                    break
+                
+                await self.master_bot.send_message(MASTER_BOT_TOKEN, f"🔄 Очередь: {phone} начинает спам")
+                
+                # Сбрасываем флаги для этого аккаунта
+                self.session_mgr.round_active = True
+                self.session_mgr.current_round_winner = None
+                
+                # Ждем, пока этот аккаунт выиграет
+                while self.session_mgr.round_active and not self.session_mgr.current_round_winner:
+                    await asyncio.sleep(1)
+                
+                if self.session_mgr.current_round_winner == phone:
+                    await self.master_bot.send_message(MASTER_BOT_TOKEN, f"✅ {phone} выиграл! Переходим к следующему аккаунту")
+                else:
+                    await self.master_bot.send_message(MASTER_BOT_TOKEN, f"⚠️ {phone} не выиграл, переходим дальше")
+                
+                # Небольшая задержка перед следующим аккаунтом
+                await asyncio.sleep(5)
+    
+    async def handle_target_message(self, phone: str, message: Message):
+        """Обработка сообщений от целевого бота"""
         text = message.text or ""
         
+        # Если пришел ZIP (выигрыш)
         if message.document and message.document.mime_type == "application/zip":
             await self.save_zip(phone, message)
             return
         
-        task_type = self.parse_task(text)
-        if not task_type:
-            return
-        
-        if self.session_mgr.won_this_round.get(phone, False):
-            return
-        
-        if phone not in self.session_mgr.spam_tasks or self.session_mgr.spam_tasks[phone].done():
-            self.session_mgr.spam_tasks[phone] = asyncio.create_task(self.spam_answers(phone, task_type))
+        # Если это задание и раунд активен для этого аккаунта
+        if self.session_mgr.round_active and not self.session_mgr.current_round_winner:
+            task_type = self.parse_task(text)
+            if task_type:
+                await self.master_bot.send_message(MASTER_BOT_TOKEN, f"📢 {phone}: Получено задание! Начинаю спам...")
+                await self.spam_answers(phone, task_type)
     
     def parse_task(self, text: str) -> Optional[str]:
         if "Гео разыгрываемого аккаунта" in text or ("Гео" in text and "аккаунта" in text):
             return "geo"
-        elif "Число от 1 до 200" in text:
+        elif "Число от 1 до " in text:
             return "number"
         return None
     
     async def spam_answers(self, phone: str, task_type: str):
+        """Спамит ответы пока не выиграет"""
         client = await self.session_mgr.get_client(phone)
         if not client:
             return
@@ -529,7 +538,7 @@ class BotHunter:
             answers = [str(i) for i in range(1, 201)] + [number_to_words_ru(i) for i in range(1, 201)]
         
         index = 0
-        while self.session_mgr.is_running and not self.session_mgr.won_this_round.get(phone, False):
+        while self.session_mgr.round_active and not self.session_mgr.current_round_winner:
             if index >= len(answers):
                 index = 0
             
@@ -543,22 +552,19 @@ class BotHunter:
             except Exception as e:
                 print(f"[{phone}] Ошибка: {e}")
                 break
-        
-        if phone in self.session_mgr.spam_tasks:
-            del self.session_mgr.spam_tasks[phone]
     
     async def save_zip(self, phone: str, message: Message):
+        """Сохраняем ZIP и отмечаем выигрыш"""
         try:
             file_path = await message.download_media(file=os.path.join(DOWNLOADS_DIR, f"{phone}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"))
             
             if self.master_bot:
                 await self.master_bot.send_file(MASTER_BOT_TOKEN, file_path, caption=f"🎉 **ВЫИГРЫШ!**\nОт: `{phone}`", parse_mode='markdown')
             
-            self.session_mgr.won_this_round[phone] = True
+            # Отмечаем, что этот аккаунт выиграл
+            self.session_mgr.current_round_winner = phone
+            self.session_mgr.round_active = False
             
-            if phone in self.session_mgr.spam_tasks:
-                self.session_mgr.spam_tasks[phone].cancel()
-                del self.session_mgr.spam_tasks[phone]
         except Exception as e:
             print(f"Ошибка сохранения ZIP: {e}")
     
@@ -587,12 +593,15 @@ async def main():
     
     print("\n✅ Бот запущен!")
     print("Откройте Telegram и отправьте /start вашему боту")
+    print("\n🔄 Режим: ПООЧЕРЕДНЫЙ СПАМ")
+    print("Аккаунты спамят по очереди, каждый выигрывает свой приз")
     print("\n📱 Команды для добавления сессии:")
     print("1. /add_phone +79991234567")
     print("2. /auth +79991234567")
     print("3. /verify +79991234567 код")
     print("4. /2fa +79991234567 пароль (если есть 2FA)")
-    print("\nНажмите Ctrl+C для остановки\n")
+    print("\n🚀 Запуск: /start_all")
+    print("Нажмите Ctrl+C для остановки\n")
     
     try:
         await hunter.master_bot.run_until_disconnected()
